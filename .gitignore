@@ -11,4 +11,13 @@ session_*
 .env
 PokemonRed.gb.state
 venv*
+.venv/
 .python-version
+
+# Training runs and checkpoints
+**/runs/
+**/runs_*/
+*.pkl
+*.zip
+**/policies/
+**/checkpoints/

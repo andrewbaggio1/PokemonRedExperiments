@@ -1,0 +1,15 @@
+[
+  {
+    "name": "PalletTown",
+    "state_path": "../init.state",
+    "save_path": "../safe_states/pallet.state",
+    "success_events": [
+      "0xD747-0"
+    ],
+    "success_rate_threshold": 0.8,
+    "mean_steps_threshold": 1800,
+    "window_size": 30,
+    "min_episodes": 30,
+    "auto_advance": true
+  }
+]

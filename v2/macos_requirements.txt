@@ -11,7 +11,8 @@ filelock==3.16.1
 fonttools==4.54.1
 fsspec==2024.9.0
 grpcio==1.67.0
-gymnasium==0.29.1
+gymnasium==0.28.1
+hnswlib==0.8.0
 imageio==2.36.0
 ipython==8.28.0
 jedi==0.19.1
@@ -42,6 +43,7 @@ PySDL2==0.9.16
 pysdl2-dll==2.30.2
 python-dateutil==2.9.0.post0
 pytz==2024.2
+ray[rllib]==2.9.0
 scikit-image==0.24.0
 scipy==1.14.1
 setuptools==75.1.0

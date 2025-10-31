@@ -1,10 +1,11 @@
 import uuid
 import json
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 from skimage.transform import downscale_local_mean
-import matplotlib.pyplot as plt
 from pyboy import PyBoy
 #from pyboy.logger import log_level
 import mediapy as media
@@ -14,6 +15,12 @@ from gymnasium import Env, spaces
 from pyboy.utils import WindowEvent
 
 from global_map import local_to_global, GLOBAL_MAP_SHAPE
+from visual_dqn.modules.action_mask_cache import (
+    ActionMaskCache,
+    ActionMaskCacheConfig,
+)
+
+BASE_DIR = Path(__file__).resolve().parent
 
 event_flags_start = 0xD747
 event_flags_end = 0xD87E # expand for SS Anne # old - 0xD7F6 
@@ -25,12 +32,14 @@ class RedGymEnv(Env):
         self.save_final_state = config["save_final_state"]
         self.print_rewards = config["print_rewards"]
         self.headless = config["headless"]
-        self.init_state = config["init_state"]
+        self.init_state = Path(config["init_state"]).expanduser()
         self.act_freq = config["action_freq"]
         self.max_steps = config["max_steps"]
         self.save_video = config["save_video"]
         self.fast_video = config["fast_video"]
-        self.frame_stacks = 3
+        self.include_action_mask = config.get("include_action_mask", False)
+        self.frame_stacks = config.get("frame_stacks", 3)
+        self.no_change_mse_threshold = config.get("no_change_mse_threshold", 1e-3)
         self.explore_weight = (
             1 if "explore_weight" not in config else config["explore_weight"]
         )
@@ -80,9 +89,22 @@ class RedGymEnv(Env):
         ]
 
         # load event names (parsed from https://github.com/pret/pokered/blob/91dc3c9f9c8fd529bb6e8307b58b96efa0bec67e/constants/event_constants.asm)
-        with open("events.json") as f:
+        events_path = BASE_DIR / "events.json"
+        with events_path.open("r", encoding="utf-8") as f:
             event_names = json.load(f)
         self.event_names = event_names
+        self.event_name_to_key = {name: key for key, name in event_names.items()}
+
+        self.curriculum_stages = self._prepare_curriculum(config.get("curriculum"))
+        self.curriculum_active = bool(self.curriculum_stages)
+        self.curriculum_idx = config.get("curriculum_start_index", 0)
+        if self.curriculum_active:
+            self.curriculum_idx = max(0, min(self.curriculum_idx, len(self.curriculum_stages) - 1))
+        else:
+            self.curriculum_idx = 0
+        self.curriculum_stage_saved = False
+        self.curriculum_first_success_step = None
+        self.curriculum_success = False
 
         self.output_shape = (72, 80, self.frame_stacks)
         self.coords_pad = 12
@@ -92,18 +114,47 @@ class RedGymEnv(Env):
         
         self.enc_freqs = 8
 
-        self.observation_space = spaces.Dict(
+        base_observation_space = spaces.Dict(
             {
-                "screens": spaces.Box(low=0, high=255, shape=self.output_shape, dtype=np.uint8),
+                "screens": spaces.Box(
+                    low=0,
+                    high=255,
+                    shape=self.output_shape,
+                    dtype=np.uint8,
+                ),
                 "health": spaces.Box(low=0, high=1),
-                "level": spaces.Box(low=-1, high=1, shape=(self.enc_freqs,)),
+                "level": spaces.Box(
+                    low=-1, high=1, shape=(self.enc_freqs,)
+                ),
                 "badges": spaces.MultiBinary(8),
-                "events": spaces.MultiBinary((event_flags_end - event_flags_start) * 8),
-                "map": spaces.Box(low=0, high=255, shape=(
-                    self.coords_pad*4,self.coords_pad*4, 1), dtype=np.uint8),
-                "recent_actions": spaces.MultiDiscrete([len(self.valid_actions)] * self.frame_stacks)
+                "events": spaces.MultiBinary(
+                    (event_flags_end - event_flags_start) * 8
+                ),
+                "map": spaces.Box(
+                    low=0,
+                    high=255,
+                    shape=(self.coords_pad * 4, self.coords_pad * 4, 1),
+                    dtype=np.uint8,
+                ),
+                "recent_actions": spaces.MultiDiscrete(
+                    [len(self.valid_actions)] * self.frame_stacks
+                ),
             }
         )
+
+        if self.include_action_mask:
+            frame_space = spaces.Box(
+                low=0.0,
+                high=1.0,
+                shape=(self.frame_stacks, self.output_shape[0], self.output_shape[1]),
+                dtype=np.float32,
+            )
+            mask_space = spaces.MultiBinary(len(self.valid_actions))
+            self.observation_space = spaces.Dict(
+                {"obs": frame_space, "action_mask": mask_space}
+            )
+        else:
+            self.observation_space = base_observation_space
 
         head = "null" if config["headless"] else "SDL2"
 
@@ -120,11 +171,183 @@ class RedGymEnv(Env):
         if not config["headless"]:
             self.pyboy.set_emulation_speed(6)
 
+        if self.include_action_mask:
+            cache_config = ActionMaskCacheConfig(
+                mse_threshold=self.no_change_mse_threshold
+            )
+            self.action_mask_cache = ActionMaskCache(cache_config)
+        else:
+            self.action_mask_cache = None
+
+        self._current_state_key = None
+        self._prev_state_key = None
+        self._prev_frames = None
+
+    def _prepare_curriculum(self, curriculum_config) -> List[Dict[str, object]]:
+        if not curriculum_config:
+            return []
+
+        stages: List[Dict[str, object]] = []
+        for idx, stage_cfg in enumerate(curriculum_config):
+            stage = dict(stage_cfg)
+            stage["index"] = idx
+            stage["name"] = stage_cfg.get("name", f"stage_{idx}")
+
+            state_path = stage_cfg.get("state_path", str(self.init_state))
+            stage["state_path"] = Path(state_path).expanduser()
+
+            save_path = stage_cfg.get("save_path")
+            stage["save_path"] = Path(save_path).expanduser() if save_path else None
+
+            identifiers = stage_cfg.get("success_events", [])
+            normalized_keys: List[str] = []
+            parsed_events: List[Tuple[int, int]] = []
+            for identifier in identifiers:
+                key, parsed = self._resolve_event_identifier(identifier)
+                normalized_keys.append(key)
+                parsed_events.append(parsed)
+            stage["success_event_keys"] = normalized_keys
+            stage["parsed_success_events"] = parsed_events
+
+            stage["window_size"] = int(stage_cfg.get("window_size", 20))
+            stage["min_episodes"] = int(
+                stage_cfg.get("min_episodes", stage["window_size"])
+            )
+            stage["success_rate_threshold"] = float(
+                stage_cfg.get("success_rate_threshold", 0.8)
+            )
+            mean_steps = stage_cfg.get("mean_steps_threshold")
+            stage["mean_steps_threshold"] = (
+                float(mean_steps) if mean_steps is not None else None
+            )
+            stage["auto_advance"] = bool(stage_cfg.get("auto_advance", True))
+            stages.append(stage)
+        return stages
+
+    def _resolve_event_identifier(self, identifier: str) -> Tuple[str, Tuple[int, int]]:
+        if identifier in self.event_names:
+            key = identifier
+        elif identifier in self.event_name_to_key:
+            key = self.event_name_to_key[identifier]
+        else:
+            raise ValueError(f"Unknown event identifier '{identifier}' in curriculum.")
+        return key, self._parse_event_key(key)
+
+    def _parse_event_key(self, key: str) -> Tuple[int, int]:
+        addr_str, bit_str = key.split("-")
+        return int(addr_str, 16), int(bit_str)
+
+    def _current_stage_config(self) -> Optional[Dict[str, object]]:
+        if not self.curriculum_active:
+            return None
+        return self.curriculum_stages[self.curriculum_idx]
+
+    def _resolve_curriculum_state_path(self) -> Path:
+        if not self.curriculum_active:
+            return self.init_state
+        stage = self._current_stage_config()
+        assert stage is not None
+        state_path = stage.get("state_path") or stage.get("save_path") or self.init_state
+        state_path = Path(state_path).expanduser()
+        if not state_path.exists():
+            raise FileNotFoundError(
+                f"Curriculum state path '{state_path}' does not exist for stage '{stage.get('name', self.curriculum_idx)}'."
+            )
+        return state_path
+
+    def _load_initial_state(self) -> None:
+        state_path = self._resolve_curriculum_state_path()
+        with state_path.open("rb") as handle:
+            self.pyboy.load_state(handle)
+
+    def get_curriculum_stage_index(self) -> int:
+        return self.curriculum_idx
+
+    def set_curriculum_stage(self, index: int) -> None:
+        if not self.curriculum_active:
+            return
+        index = max(0, min(index, len(self.curriculum_stages) - 1))
+        if index != self.curriculum_idx:
+            self.curriculum_idx = index
+            self.curriculum_stage_saved = False
+            self.curriculum_first_success_step = None
+            self.curriculum_success = False
+
+    def save_curriculum_state(self) -> bool:
+        if not self.curriculum_active:
+            return False
+        stage = self._current_stage_config()
+        if not stage:
+            return False
+        save_path = stage.get("save_path")
+        if not save_path:
+            self.curriculum_stage_saved = True
+            return True
+
+        save_path = Path(save_path).expanduser()
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        if save_path.exists():
+            self.curriculum_stage_saved = True
+            return True
+
+        with save_path.open("wb") as handle:
+            self.pyboy.save_state(handle)
+        self.curriculum_stage_saved = True
+        return True
+
+    def advance_curriculum(self) -> bool:
+        if not self.curriculum_active:
+            return False
+        if self.curriculum_idx >= len(self.curriculum_stages) - 1:
+            return False
+        self.curriculum_idx += 1
+        self.curriculum_stage_saved = False
+        self.curriculum_first_success_step = None
+        self.curriculum_success = False
+        return True
+
+    def _update_curriculum_success(self) -> None:
+        stage = self._current_stage_config()
+        if not stage:
+            return
+        parsed_events: List[Tuple[int, int]] = stage.get("parsed_success_events", [])
+        if not parsed_events:
+            return
+        success = all(self.read_bit(addr, bit) for addr, bit in parsed_events)
+        if success:
+            if self.curriculum_first_success_step is None:
+                self.curriculum_first_success_step = self.step_count + 1
+            self.curriculum_success = True
+
+    def _curriculum_step_info(self) -> Optional[Dict[str, object]]:
+        stage = self._current_stage_config()
+        if not stage:
+            return None
+        return {
+            "stage_index": self.curriculum_idx,
+            "stage_name": stage.get("name"),
+            "success": bool(self.curriculum_success),
+            "first_success_step": self.curriculum_first_success_step,
+            "success_event_keys": stage.get("success_event_keys", []),
+            "success_rate_threshold": stage.get("success_rate_threshold"),
+            "mean_steps_threshold": stage.get("mean_steps_threshold"),
+            "window_size": stage.get("window_size"),
+            "min_episodes": stage.get("min_episodes"),
+        }
+
     def reset(self, seed=None, options={}):
         self.seed = seed
         # restart game, skipping credits
-        with open(self.init_state, "rb") as f:
-            self.pyboy.load_state(f)
+        self._load_initial_state()
+        if self.action_mask_cache:
+            self.action_mask_cache.reset()
+            self._current_state_key = None
+            self._prev_state_key = None
+            self._prev_frames = None
+
+        if self.curriculum_active:
+            self.curriculum_first_success_step = None
+            self.curriculum_success = False
 
         self.init_map_mem()
 
@@ -162,7 +385,12 @@ class RedGymEnv(Env):
         self.progress_reward = self.get_game_state_reward()
         self.total_reward = sum([val for _, val in self.progress_reward.items()])
         self.reset_count += 1
-        return self._get_obs(), {}
+        base_obs = self._get_obs()
+        if self.include_action_mask:
+            obs = self._prepare_masked_observation()
+        else:
+            obs = base_obs
+        return obs, {}
 
     def init_map_mem(self):
         self.seen_coords = {}
@@ -198,7 +426,24 @@ class RedGymEnv(Env):
 
         return observation
 
+    def _prepare_masked_observation(self):
+        if not self.action_mask_cache:
+            raise RuntimeError("Action mask cache requested but not initialized.")
+        frames = np.transpose(self.recent_screens, (2, 0, 1)).astype(np.float32) / 255.0
+        state_key = self.action_mask_cache.compute_state_key(self.recent_screens)
+        mask = self.action_mask_cache.get_mask(state_key, len(self.valid_actions))
+        self._prev_frames = np.copy(self.recent_screens)
+        self._current_state_key = state_key
+        self._prev_state_key = state_key
+        return {"obs": frames, "action_mask": mask}
+
     def step(self, action):
+        prev_key = self._current_state_key if self.include_action_mask else None
+        prev_frames = (
+            np.copy(self._prev_frames)
+            if self.include_action_mask and self._prev_frames is not None
+            else None
+        )
 
         if self.save_video and self.step_count == 0:
             self.start_video()
@@ -222,9 +467,18 @@ class RedGymEnv(Env):
 
         self.update_map_progress()
 
+        if self.curriculum_active:
+            self._update_curriculum_success()
+
         step_limit_reached = self.check_if_done()
 
         obs = self._get_obs()
+        if self.include_action_mask:
+            if prev_key is not None and prev_frames is not None:
+                self.action_mask_cache.record_transition(
+                    prev_key, action, prev_frames, self.recent_screens
+                )
+            obs = self._prepare_masked_observation()
 
         # self.save_and_print_info(step_limit_reached, obs)
 
@@ -244,7 +498,13 @@ class RedGymEnv(Env):
 
         self.step_count += 1
 
-        return obs, new_reward, False, step_limit_reached, {}
+        info = {}
+        if self.curriculum_active:
+            curriculum_info = self._curriculum_step_info()
+            if curriculum_info:
+                info["curriculum"] = curriculum_info
+
+        return obs, new_reward, False, step_limit_reached, info
     
     def run_action_on_emulator(self, action):
         # press button then release after some steps
