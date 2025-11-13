@@ -1,0 +1,147 @@
+{
+  "paths": {
+    "rom_path": "PokemonRedStreaming/pokemon_red.gb",
+    "save_dir": "cluster_runs",
+    "run_name": "run1",
+    "logs_dir": "logs"
+  },
+  "vision": {
+    "hi_res_channels": 128,
+    "lo_res_channels": 160,
+    "stem_type": "preact",
+    "res_blocks_hi": 4,
+    "res_blocks_lo": 5,
+    "se_reduction": 8,
+    "deformable": false,
+    "attention_type": "mhsa",
+    "attention_heads": 4,
+    "attention_depth": true,
+    "attention_dropout": 0.1,
+    "feature_dropout": 0.1
+  },
+  "context": {
+    "static_dim": 128,
+    "event_dim": 64,
+    "mlp_hidden": 192,
+    "use_film": true
+  },
+  "temporal": {
+    "gru_hidden": 384,
+    "lstm_hidden": 384,
+    "transformer": {
+      "d_model": 512,
+      "nhead": 4,
+      "depth": 2,
+      "dim_feedforward": 1024,
+      "dropout": 0.1
+    },
+    "latent_target_dim": 1344
+  },
+  "heads": {
+    "dueling": {
+      "hidden": 512
+    },
+    "num_quantiles": 51,
+    "aux": {
+      "context_recon_weight": 0.25,
+      "inverse_dynamics_weight": 0.1,
+      "reward_forecast_weight": 0.1
+    }
+  },
+  "training": {
+    "batch_size": 32,
+    "unroll_length": 64,
+    "burn_in": 32,
+    "gamma": 0.99,
+    "n_step": 5,
+    "prioritized_alpha": 0.6,
+    "prioritized_beta_frames": 200000,
+    "learn_start_steps": 10000,
+    "train_frequency": 4,
+    "target_sync_interval_updates": 4000,
+    "grad_clip": 1.0,
+    "amp": true,
+    "optimizer": {
+      "name": "adamw",
+      "lr": 0.00025,
+      "betas": [
+        0.9,
+        0.999
+      ],
+      "weight_decay": 0.01,
+      "eps": 1e-08
+    },
+    "multi_gpu": {
+      "mode": "dp",
+      "world_size": 1,
+      "device_ids": null,
+      "nccl_timeout_s": 180
+    },
+    "actors": {
+      "per_gpu": 4,
+      "total": 4,
+      "epsilon_start": 1.0,
+      "epsilon_end": 0.05,
+      "epsilon_decay_steps": 1000000,
+      "action_duration_options": [
+        1,
+        2,
+        4,
+        8
+      ]
+    },
+    "target_total_steps": 25000000,
+    "max_steps_per_episode": 4000
+  },
+  "replay": {
+    "capacity_transitions": 1000000,
+    "save_stats": true
+  },
+  "checkpointing": {
+    "interval_minutes": 5,
+    "max_keep": 6,
+    "include_replay_stats": true,
+    "include_actor_snapshots": true
+  },
+  "resume": {
+    "resume_policy": "latest",
+    "resume_from_id": null
+  },
+  "emulator": {
+    "frame_skip": 4,
+    "boot_steps": 120,
+    "input_spacing_frames": 1,
+    "continuous_mode": true,
+    "snapshots_dir": "snapshots",
+    "flatline_steps_threshold": 800,
+    "min_delta_pos": 1,
+    "min_delta_reward": 0.1,
+    "action_reset": [
+      "hold_A",
+      12
+    ],
+    "max_no_input_frames": 600,
+    "headless": true,
+    "delete_sav_on_reset": false,
+    "snapshot_interval_minutes": 10,
+    "occupancy_crop_radius": 10
+  },
+  "telemetry": {
+    "enabled": true,
+    "flush_interval_s": 2.0,
+    "max_queue": 2048,
+    "events_file": "events.jsonl",
+    "throttle_hz": 5.0
+  },
+  "log_interval_steps": 2000,
+  "seed": 42,
+  "log_episodes_for_replay": true,
+  "replay_log_dir": "episode_logs",
+  "base_seed": 7,
+  "affordance_fail_threshold": 3,
+  "affordance_decay": 0.995,
+  "max_runtime_seconds": 13500,
+  "segment_length": 2000,
+  "resume_from_snapshot": true,
+  "total_episodes": 0
+}

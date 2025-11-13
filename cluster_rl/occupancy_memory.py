@@ -39,7 +39,12 @@ class ClusterEnv(gym.Env):
 
     @property
     def pyboy(self):
-        return getattr(self.env, "pyboy")
+        env = self.env
+        while env is not None:
+            if hasattr(env, "pyboy"):
+                return getattr(env, "pyboy")
+            env = getattr(env, "env", None)
+        raise AttributeError("Underlying environment does not expose a PyBoy instance.")
 
     def _ensure_maps(self, map_id: int) -> None:
         s = self.cfg.map_size

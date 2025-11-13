@@ -62,6 +62,12 @@ class ClusterConfig:
     occupancy_crop_radius: int
     # Runtime management
     max_runtime_seconds: Optional[int]
+    # Continuous-run mode (optional)
+    continuous_mode: bool
+    segment_length: int  # transitions per segment when continuous_mode is on
+    snapshot_interval_minutes: int
+    resume_from_snapshot: bool
+    snapshots_dir: str
 
     @property
     def run_dir(self) -> str:
@@ -114,6 +120,11 @@ class ClusterConfig:
             action_duration_options=(1, 2, 4, 8),
             occupancy_crop_radius=10,
             max_runtime_seconds=13_500,  # ~3.75 hours
+            continuous_mode=False,
+            segment_length=2000,
+            snapshot_interval_minutes=10,
+            resume_from_snapshot=True,
+            snapshots_dir="snapshots",
         )
 
 

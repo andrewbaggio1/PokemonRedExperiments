@@ -84,6 +84,7 @@ def learner_loop(
     env_steps_total = int(initial_env_steps)
     global_updates = 0
     last_sync = 0
+    last_log_steps = env_steps_total
     try:
         while not stop_event.is_set():
             # Consume new episodes
@@ -98,6 +99,13 @@ def learner_loop(
                 replay.add_episode(trans)
                 env_steps_total += len(trans)
                 save_json(progress_path, {"env_steps": env_steps_total})
+                # Periodic progress log
+                try:
+                    if env_steps_total - last_log_steps >= max(1000, int(cfg.log_interval_steps)):
+                        print(f"[learner] env_steps={env_steps_total:,} replay_size={len(replay):,} updates={global_updates:,}")
+                        last_log_steps = env_steps_total
+                except Exception:
+                    pass
                 if env_steps_total >= cfg.target_total_steps:
                     stop_event.set()
             if len(replay) >= cfg.learn_start_steps and not stop_event.is_set():
@@ -183,6 +191,10 @@ def learner_loop(
                     except Exception:
                         pass
                     last_sync = global_updates
+                    try:
+                        print(f"[learner] target synced at update={global_updates:,} env_steps={env_steps_total:,}")
+                    except Exception:
+                        pass
             if stop_event.is_set():
                 break
     except KeyboardInterrupt:

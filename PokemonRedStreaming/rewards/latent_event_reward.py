@@ -4,7 +4,7 @@ import hashlib
 from collections import defaultdict
 from typing import Dict, Iterable
 
-from map_features import region_one_hot
+from PokemonRedStreaming.map_features import region_one_hot
 
 
 class LatentEventReward:

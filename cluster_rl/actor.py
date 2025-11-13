@@ -4,6 +4,8 @@ import os
 from typing import Optional
 
 import queue
+import time
+from io import BytesIO
 
 import numpy as np
 import torch
@@ -65,14 +67,14 @@ def build_rewards(cfg: ClusterConfig):
     return modules
 
 
-def make_env(cfg: ClusterConfig, show_display: bool = False) -> ClusterEnv:
+def make_env(cfg: ClusterConfig, show_display: bool = False, resume_state_path: Optional[str] = None) -> ClusterEnv:
     base = PokemonRedEnv(
         rom_path=cfg.rom_path,
         show_display=bool(show_display and not cfg.headless),
         frame_skip=cfg.frame_skip,
         boot_steps=cfg.boot_steps,
         max_no_input_frames=cfg.max_no_input_frames,
-        state_path=None,
+        state_path=resume_state_path,
         story_flag_defs=None,
         track_visit_stats=True,
         delete_sav_on_reset=cfg.delete_sav_on_reset,
@@ -107,7 +109,14 @@ def actor_process(
       - logs minimal replay data if enabled (one file per episode)
     """
     device = torch.device("cpu")
-    env = make_env(cfg, show_display=False)
+    # Resume from per-actor snapshot if enabled and present
+    resume_state_path: Optional[str] = None
+    if getattr(cfg, "resume_from_snapshot", False):
+        snap_dir = os.path.join(cfg.run_dir, getattr(cfg, "snapshots_dir", "snapshots"))
+        latest = os.path.join(snap_dir, f"actor{rank}_latest.state")
+        if os.path.exists(latest):
+            resume_state_path = latest
+    env = make_env(cfg, show_display=False, resume_state_path=resume_state_path)
     afford = AffordanceMemory(num_actions=env.action_space.n, fail_threshold=cfg.affordance_fail_threshold, decay=cfg.affordance_decay)
     # Initialize a tiny model to shape action choices when parameters are available
     obs_shape = env.observation_space.shape
@@ -121,6 +130,13 @@ def actor_process(
     last_param_mtime = 0.0
     step_counter = 0
     episode = 0
+    segment_idx = 0
+    segment_start_state: Optional[bytes] = None
+    last_snapshot_time = time.monotonic()
+    snapshot_interval_s = max(1, int(getattr(cfg, "snapshot_interval_minutes", 10))) * 60
+    snapshots_dir = os.path.join(cfg.run_dir, getattr(cfg, "snapshots_dir", "snapshots"))
+    ensure_dir(snapshots_dir)
+    last_seg_log = -1
     max_episodes = cfg.total_episodes if cfg.total_episodes > 0 else None
     try:
         while not stop_event.is_set():
@@ -139,12 +155,24 @@ def actor_process(
                 pass
             obs, info = env.reset(seed=cfg.base_seed + rank + episode)
             ep_savestate = info.get("episode_savestate")
+            if segment_start_state is None:
+                # Seed the first segment with a starting savestate (either from reset or resume)
+                try:
+                    if ep_savestate:
+                        segment_start_state = bytes(ep_savestate)
+                    else:
+                        buf = BytesIO()
+                        env.pyboy.save_state(buf)  # type: ignore[attr-defined]
+                        segment_start_state = buf.getvalue()
+                except Exception:
+                    segment_start_state = b""
             hidden = policy.init_hidden(1, device)
             done = False
             ep_actions = []
             prev_obs_proc = preprocess_obs(obs)
             prev_info = info
-            for t in range(cfg.max_steps_per_episode):
+            max_steps = cfg.max_steps_per_episode if not getattr(cfg, "continuous_mode", False) else 1_000_000_000
+            for t in range(max_steps):
                 if stop_event.is_set():
                     break
                 step_counter += 1
@@ -176,27 +204,99 @@ def actor_process(
                 hidden = next_hidden
                 ep_actions.append(int(action))
                 prev_obs_proc, prev_info = next_obs_proc, next_info
+                # Periodic actor-side snapshots for resuming long runs
+                now = time.monotonic()
+                if now - last_snapshot_time >= snapshot_interval_s:
+                    try:
+                        buf = BytesIO()
+                        env.pyboy.save_state(buf)  # type: ignore[attr-defined]
+                        tmp = os.path.join(snapshots_dir, f"actor{rank}_{int(now)}.state.tmp")
+                        final = os.path.join(snapshots_dir, f"actor{rank}_{int(now)}.state")
+                        with open(tmp, "wb") as fh:
+                            fh.write(buf.getvalue())
+                        os.replace(tmp, final)
+                        # Update latest pointer
+                        latest = os.path.join(snapshots_dir, f"actor{rank}_latest.state")
+                        try:
+                            os.replace(final, latest)
+                        except Exception:
+                            # If replace failed because latest exists, copy bytes into latest
+                            with open(final, "rb") as src, open(latest, "wb") as dst:
+                                dst.write(src.read())
+                        try:
+                            print(f"[actor {rank}] snapshot saved at t={int(now - last_snapshot_time)}s")
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                    last_snapshot_time = now
+                # In continuous mode, flush segments without resetting
+                if getattr(cfg, "continuous_mode", False) and len(transitions) >= max(1, int(getattr(cfg, "segment_length", 2000))):
+                    # Ship segment
+                    while not stop_event.is_set():
+                        try:
+                            out_queue.put(("episode", transitions), timeout=1.0)
+                            break
+                        except queue.Full:
+                            continue
+                    # Log segment for offline replay
+                    if cfg.log_episodes_for_replay and log_dir:
+                        try:
+                            ensure_dir(log_dir)
+                            seg_path = os.path.join(log_dir, f"actor{rank}_seg{segment_idx:05d}.npz")
+                            start_bytes = segment_start_state or b""
+                            np.savez_compressed(seg_path, actions=np.asarray(ep_actions, dtype=np.int16), savestate=np.frombuffer(start_bytes, dtype=np.uint8))
+                        except Exception:
+                            pass
+                    segment_idx += 1
+                    # Prepare next segment starting point
+                    try:
+                        buf = BytesIO()
+                        env.pyboy.save_state(buf)  # type: ignore[attr-defined]
+                        segment_start_state = buf.getvalue()
+                    except Exception:
+                        segment_start_state = b""
+                    transitions = []
+                    ep_actions = []
+                    if segment_idx % 10 == 0 and last_seg_log != segment_idx:
+                        try:
+                            print(f"[actor {rank}] segments flushed: {segment_idx}")
+                            last_seg_log = segment_idx
+                        except Exception:
+                            pass
                 if terminated or truncated:
                     break
             if stop_event.is_set():
                 break
-            # Ship episode to learner
-            while not stop_event.is_set():
-                try:
-                    out_queue.put(("episode", transitions), timeout=1.0)
-                    break
-                except queue.Full:
-                    continue
-            # Log episode for offline replay if requested
-            if cfg.log_episodes_for_replay and log_dir:
-                try:
-                    ensure_dir(log_dir)
-                    ep_path = os.path.join(log_dir, f"actor{rank}_ep{episode:05d}.npz")
-                    # Save minimal: savestate bytes + actions
-                    savestate_bytes = ep_savestate if isinstance(ep_savestate, (bytes, bytearray)) else b""
-                    np.savez_compressed(ep_path, actions=np.asarray(ep_actions, dtype=np.int16), savestate=np.frombuffer(savestate_bytes, dtype=np.uint8))
-                except Exception:
-                    pass
+            # Flush tail either as an episode (default) or as the final segment chunk
+            if transitions:
+                while not stop_event.is_set():
+                    try:
+                        out_queue.put(("episode", transitions), timeout=1.0)
+                        break
+                    except queue.Full:
+                        continue
+                if cfg.log_episodes_for_replay and log_dir:
+                    try:
+                        ensure_dir(log_dir)
+                        if getattr(cfg, "continuous_mode", False):
+                            seg_path = os.path.join(log_dir, f"actor{rank}_seg{segment_idx:05d}.npz")
+                            start_bytes = segment_start_state or b""
+                            np.savez_compressed(seg_path, actions=np.asarray(ep_actions, dtype=np.int16), savestate=np.frombuffer(start_bytes, dtype=np.uint8))
+                            segment_idx += 1
+                            # Prepare next segment start
+                            try:
+                                buf = BytesIO()
+                                env.pyboy.save_state(buf)  # type: ignore[attr-defined]
+                                segment_start_state = buf.getvalue()
+                            except Exception:
+                                segment_start_state = b""
+                        else:
+                            ep_path = os.path.join(log_dir, f"actor{rank}_ep{episode:05d}.npz")
+                            savestate_bytes = ep_savestate if isinstance(ep_savestate, (bytes, bytearray)) else b""
+                            np.savez_compressed(ep_path, actions=np.asarray(ep_actions, dtype=np.int16), savestate=np.frombuffer(savestate_bytes, dtype=np.uint8))
+                    except Exception:
+                        pass
             episode += 1
     except KeyboardInterrupt:
         pass

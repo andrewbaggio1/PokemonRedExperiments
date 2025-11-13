@@ -3,7 +3,8 @@ from __future__ import annotations
 import argparse
 import io
 import os
-from typing import Optional
+from typing import Optional, Dict, List, Tuple
+import re
 
 import numpy as np
 
@@ -28,6 +29,8 @@ def _parse_args():
     p.add_argument("--map-out", default=None, help="Directory for map heatmaps (defaults to <out>/maps)")
     p.add_argument("--fps", type=int, default=30, help="Output frames per second")
     p.add_argument("--config", default=None, help="Optional cluster config to mirror env settings")
+    p.add_argument("--split", action="store_true", help="Emit one video per segment (legacy mode). Default is one video per actor.")
+    p.add_argument("--ext", choices=["mp4", "mov"], default="mp4", help="Output container/extension (default: mp4).")
     return p.parse_args()
 
 
@@ -60,6 +63,64 @@ def _build_env(args, cfg) -> ClusterEnv:
     return cluster_env
 
 
+def _get_pyboy_screen(pyboy):
+    """Return a screen interface compatible with both old and new PyBoy versions."""
+    try:
+        return pyboy.screen
+    except AttributeError:
+        return pyboy.botsupport_manager().screen()
+
+
+def _screen_frame(screen) -> np.ndarray:
+    """Extract an RGB frame from a PyBoy screen object across versions."""
+    if hasattr(screen, "screen_ndarray"):
+        frame = screen.screen_ndarray()
+    elif hasattr(screen, "buffer"):
+        frame = np.asarray(screen.buffer, dtype=np.uint8).reshape(144, 160, 3)
+    else:
+        frame = np.asarray(screen.screen_image(), dtype=np.uint8)
+    return np.array(frame, copy=True)
+
+def _group_segments_by_actor(paths: List[str]) -> Dict[int, List[Tuple[int, str]]]:
+    """
+    Group and sort segment files by actor id.
+    Returns mapping: actor_id -> list of (segment_index, path) sorted by index.
+    """
+    groups: Dict[int, List[Tuple[int, str]]] = {}
+    pat = re.compile(r"actor(\d+)_(?:seg|ep)(\d+)\.npz$")
+    for p in paths:
+        name = os.path.basename(p)
+        m = pat.search(name)
+        if not m:
+            continue
+        actor_id = int(m.group(1))
+        seg_idx = int(m.group(2))
+        groups.setdefault(actor_id, []).append((seg_idx, p))
+    for aid in groups:
+        groups[aid].sort(key=lambda t: t[0])
+    return groups
+
+def _merge_occupancy(dst: Optional[np.ndarray], src: Dict[int, np.ndarray]) -> Optional[np.ndarray]:
+    """Aggregate occupancy maps across all tiles by max merge into a single array."""
+    aggregate = dst.copy() if dst is not None else None
+    for occ in src.values():
+        if aggregate is None:
+            aggregate = occ.copy()
+        else:
+            # Pad if shapes differ (should not in practice)
+            h = max(aggregate.shape[0], occ.shape[0])
+            w = max(aggregate.shape[1], occ.shape[1])
+            if aggregate.shape != (h, w):
+                pad_agg = np.zeros((h, w), dtype=np.float32)
+                pad_agg[: aggregate.shape[0], : aggregate.shape[1]] = aggregate
+                aggregate = pad_agg
+            if occ.shape != (h, w):
+                pad_occ = np.zeros((h, w), dtype=np.float32)
+                pad_occ[: occ.shape[0], : occ.shape[1]] = occ
+                occ = pad_occ
+            aggregate = np.maximum(aggregate, occ)
+    return aggregate
+
 def _seed_occupancy(env: ClusterEnv) -> None:
     inner_env = env.env.env  # PokemonRedEnv
     _ = inner_env._obs()
@@ -82,7 +143,7 @@ def _save_map_image(env: ClusterEnv, path: str, episode_label: str) -> None:
     vmax = max(1.0, float(aggregate.max()))
     plt.figure(figsize=(5, 5))
     plt.imshow(aggregate, cmap="plasma", origin="lower", vmin=0.0, vmax=vmax)
-    plt.title(f"Episode {episode_label} Occupancy")
+    plt.title(f"{episode_label} Occupancy")
     plt.xlabel("X")
     plt.ylabel("Y")
     plt.tight_layout()
@@ -105,34 +166,93 @@ def main():
         print("No episode logs found.")
         return
     env = _build_env(args, cfg)
-    screen = env.pyboy.screen
-    frame_shape = screen.ndarray.shape[:2]
-    for ep_path in ep_files:
-        actions, savestate = _load_episode(ep_path)
-        writer = SimpleVideoWriter(os.path.join(args.out, os.path.basename(ep_path).replace(".npz", ".mp4")), args.fps, frame_shape)
-        env.reset()
-        if savestate:
-            buf = io.BytesIO(savestate)
-            env.pyboy.load_state(buf)
-        env._map_occ.clear()
-        env._map_sal.clear()
-        env._last_map = None
-        env._last_coords = None
-        _seed_occupancy(env)
-        frame = np.array(screen.ndarray, copy=True)
-        writer.write_rgb(frame)
-        for action in actions:
-            obs, _, terminated, truncated, info = env.step(int(action))
-            frame = info.get("raw_frame")
-            if frame is None:
-                frame = np.array(screen.ndarray, copy=True)
+    screen = _get_pyboy_screen(env.pyboy)
+    frame_shape = _screen_frame(screen).shape[:2]
+
+    if args.split:
+        print(f"[replayer] Split mode: writing one file per segment ({len(ep_files)} segments).")
+        for i, ep_path in enumerate(ep_files, 1):
+            actions, savestate = _load_episode(ep_path)
+            out_name = os.path.basename(ep_path).replace(".npz", f".{args.ext}")
+            writer = SimpleVideoWriter(os.path.join(args.out, out_name), args.fps, frame_shape)
+            env.reset()
+            if savestate:
+                buf = io.BytesIO(savestate)
+                env.pyboy.load_state(buf)
+            env._map_occ.clear()
+            env._map_sal.clear()
+            env._last_map = None
+            env._last_coords = None
+            _seed_occupancy(env)
+            frame = _screen_frame(screen)
             writer.write_rgb(frame)
-            if terminated or truncated:
-                break
+            for action in actions:
+                obs, _, terminated, truncated, info = env.step(int(action))
+                frame = info.get("raw_frame")
+                if frame is None:
+                    frame = _screen_frame(screen)
+                writer.write_rgb(frame)
+                if terminated or truncated:
+                    break
+            writer.close()
+            if plt is not None:
+                map_path = os.path.join(map_dir, os.path.basename(ep_path).replace(".npz", ".png"))
+                _save_map_image(env, map_path, os.path.basename(ep_path).replace(".npz", ""))
+            if i % 10 == 0 or i == len(ep_files):
+                print(f"[replayer] processed {i}/{len(ep_files)} segments")
+        env.close()
+        return
+
+    # Continuous mode per actor
+    groups = _group_segments_by_actor(ep_files)
+    if not groups:
+        print("No actor-labeled logs found (expected files like actor0_seg00000.npz).")
+        env.close()
+        return
+    print(f"[replayer] Continuous mode: {len(groups)} actor groups found.")
+    for actor_id, items in sorted(groups.items(), key=lambda kv: kv[0]):
+        total = len(items)
+        out_path = os.path.join(args.out, f"actor{actor_id}.{args.ext}")
+        writer = SimpleVideoWriter(out_path, args.fps, frame_shape)
+        actor_agg_occ: Optional[np.ndarray] = None
+        for idx, (seg_idx, ep_path) in enumerate(items, 1):
+            actions, savestate = _load_episode(ep_path)
+            env.reset()
+            if savestate:
+                buf = io.BytesIO(savestate)
+                env.pyboy.load_state(buf)
+            env._map_occ.clear()
+            env._map_sal.clear()
+            env._last_map = None
+            env._last_coords = None
+            _seed_occupancy(env)
+            frame = _screen_frame(screen)
+            writer.write_rgb(frame)
+            for action in actions:
+                obs, _, terminated, truncated, info = env.step(int(action))
+                frame = info.get("raw_frame")
+                if frame is None:
+                    frame = _screen_frame(screen)
+                writer.write_rgb(frame)
+                if terminated or truncated:
+                    break
+            # Merge occupancy for this segment into actor aggregate
+            actor_agg_occ = _merge_occupancy(actor_agg_occ, env._map_occ)
+            if idx % 10 == 0 or idx == total:
+                print(f"[replayer] actor {actor_id}: {idx}/{total} segments")
         writer.close()
-        if plt is not None:
-            map_path = os.path.join(map_dir, os.path.basename(ep_path).replace(".npz", ".png"))
-            _save_map_image(env, map_path, os.path.basename(ep_path).replace(".npz", ""))
+        if plt is not None and actor_agg_occ is not None and np.any(actor_agg_occ):
+            vmax = max(1.0, float(actor_agg_occ.max()))
+            plt.figure(figsize=(5, 5))
+            plt.imshow(actor_agg_occ, cmap="plasma", origin="lower", vmin=0.0, vmax=vmax)
+            plt.title(f"Actor {actor_id} Occupancy")
+            plt.xlabel("X")
+            plt.ylabel("Y")
+            plt.tight_layout()
+            map_path = os.path.join(map_dir, f"actor{actor_id}.png")
+            plt.savefig(map_path, dpi=150)
+            plt.close()
+        print(f"[replayer] actor {actor_id}: wrote {out_path}")
     env.close()
 
 

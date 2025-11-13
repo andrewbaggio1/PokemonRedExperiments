@@ -1,0 +1,29 @@
+1. Input Frame Preprocessing  
+   - Source: `env_pokemon.py` downsamples each 160×144 RGB screen grab to a 72×80 single-channel frame and normalises it for the network.
+
+2. Visual Stem  
+   - Source: `simple_dqn.py` `SimpleDQN.stem` applies two strided convolutions with batch normalisation and ReLU to shrink spatial resolution and expand channels (C→64→128).
+
+3. Residual Encoding Stack  
+   - Three `ResidualBlock`s (with squeeze-and-excite gating) deepen the feature extractor while preserving resolution, enabling richer spatial features.
+
+4. Spatial Attention Layer  
+   - `SpatialAttention` flattens the feature map into tokens and runs multi-head self-attention to capture long-range dependencies, then adds the attended output back (residual).
+
+5. Post-Attention Projection  
+   - A 1×1 convolution + batch norm + ReLU lifts features to 256 channels before global pooling and dropout pack the visual context into a single 256-D vector.
+
+6. Map Feature Encoder  
+   - `map_net` is a two-layer MLP with LayerNorm that embeds handcrafted game-state signals from `map_features.extract_map_features` (map coverage, revisit stats, party HP, enemy HP ratio, etc.) into a 128-D representation.
+
+7. Temporal Fusion  
+   - The fused [visual 256-D | map 128-D] embedding fans out to a parallel GRU (`hidden_size=512`) for short-term dynamics and a larger LSTM (`hidden_size=768`) for longer-horizon memory; their outputs are concatenated before the dueling head.
+
+8. Dueling Distributional Head  
+   - Two separate NoisyLinear MLP streams predict quantile distributions: the value stream outputs 51 quantiles for the state value, the advantage stream outputs 51 quantiles per action, and they combine into the final action-value distribution.
+
+9. Auxiliary Map Reconstruction Head  
+   - An additional MLP regresses the encoded map features, encouraging the shared latent state to retain environment context (weighted by `auxiliary_loss_coef` during training).
+
+10. Exploration-Friendly Noisy Layers  
+    - All fully connected layers inside the dueling head are `NoisyLinear`, injecting parameterised Gaussian noise to support efficient exploration instead of ε-greedy on policy outputs alone.

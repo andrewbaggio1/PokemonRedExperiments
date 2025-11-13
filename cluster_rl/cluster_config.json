@@ -5,7 +5,7 @@
   "total_episodes": 0,
   "target_total_steps": 25000000,
   "max_steps_per_episode": 2000,
-  "num_actors": 4,
+  "num_actors": 48,
   "unroll_length": 64,
   "burn_in": 32,
   "batch_size": 32,
@@ -26,7 +26,7 @@
   "max_no_input_frames": 600,
   "input_spacing_frames": 1,
   "headless": true,
-  "delete_sav_on_reset": true,
+  "delete_sav_on_reset": false,
   "log_interval_steps": 2000,
   "checkpoint_every_episodes": 50,
   "use_spatial_attention": true,
@@ -39,7 +39,12 @@
   "affordance_decay": 0.995,
   "action_duration_options": [1, 2, 4, 8],
   "occupancy_crop_radius": 10,
-  "max_runtime_seconds": 13500
+  "max_runtime_seconds": 13500,
+  "continuous_mode": true,
+  "segment_length": 2000,
+  "snapshot_interval_minutes": 10,
+  "resume_from_snapshot": true,
+  "snapshots_dir": "snapshots"
 }
 
 
